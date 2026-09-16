@@ -1,0 +1,48 @@
+{
+  "name": "libmtp-web",
+  "version": "0.1.0+1.1.23",
+  "description": "libmtp compiled to WebAssembly: MTP device access over WebUSB, exposed through a File System Access API-shaped handle interface",
+  "license": "LGPL-2.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fstanis/libmtp-web.git"
+  },
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./dist/mtp.wasm": "./dist/mtp.wasm"
+  },
+  "files": [
+    "dist"
+  ],
+  "browserslist": [
+    "chrome >= 137"
+  ],
+  "sideEffects": false,
+  "keywords": [
+    "mtp",
+    "libmtp",
+    "webusb",
+    "wasm"
+  ],
+  "scripts": {
+    "build:wasm": "xmake f -y && xmake build -r mtpwasm",
+    "build:js": "esbuild src/index.ts --bundle --format=esm --target=esnext --alias:mtp-loader=./build/generated/mtp.js --outfile=dist/index.js",
+    "build:types": "tsc -p tsconfig.build.json",
+    "build": "npm run build:wasm && npm run build:js && npm run build:types",
+    "prepublishOnly": "npm run build",
+    "lint": "prettier --check .",
+    "format": "prettier --write .",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/w3c-web-usb": "^1.0.10",
+    "esbuild": "^0.24.0",
+    "prettier": "^3.9.6",
+    "typescript": "^5.6.0"
+  }
+}
