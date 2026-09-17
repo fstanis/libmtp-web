@@ -30,12 +30,7 @@ interface MtpModule {
 
 declare const Module: MtpModule;
 
-// WebUSB awaits libmtp passes no deadline to; a wedged device must not hang the wasm stack forever.
-const USB_STEP_TIMEOUT_MS = 5000;
-const USB_RESET_TIMEOUT_MS = 10000;
-const USB_CONTROL_TIMEOUT_MS = 5000;
-// libmtp's own timeouts are always nonzero in practice; this only bounds an infinite (timeout 0) wait.
-const USB_BULK_MAX_TIMEOUT_MS = 120000;
+declare const usbTimeouts: { stepMs: number; resetMs: number; controlMs: number; bulkMaxMs: number };
 
 // emcc text-scans for `name: function (...)`, so entries use function
 // expressions, and only library members reach the emitted module: shared
@@ -44,6 +39,8 @@ const USB_BULK_MAX_TIMEOUT_MS = 120000;
 const lib = {
   // libusb-1.0 error codes (enum libusb_error) the backend returns.
   $libusb_errors: { IO: -1, NO_DEVICE: -4, BUSY: -6, TIMEOUT: -7, PIPE: -9 },
+  // libmtp passes no deadline to these awaits; bulkMaxMs only bounds an infinite (timeout 0) wait.
+  $usbTimeouts: { stepMs: 5000, resetMs: 10000, controlMs: 5000, bulkMaxMs: 120000 },
   $mtp_usb_registry: function (): MtpUsbRegistry {
     if (!Module.mtpUsb) {
       Module.mtpUsb = { devices: [], order: [], nextId: 1, lastError: '', lastLoggedError: '', poisoned: new Set() };
@@ -51,7 +48,7 @@ const lib = {
     return Module.mtpUsb;
   },
 
-  // null when the id is unknown or its transport was poisoned by a timed-out transfer.
+  $mtp_usb_live_device__deps: ['$mtp_usb_registry'],
   $mtp_usb_live_device: function (id: number): USBDevice | null {
     const registry = mtp_usb_registry();
     const device = registry.devices[id];
@@ -311,7 +308,7 @@ const lib = {
     }
     console.log(`[mtp-webusb] open(): calling device.open() for id=${id}`);
     try {
-      await mtp_with_timeout(device.open(), USB_STEP_TIMEOUT_MS);
+      await mtp_with_timeout(device.open(), usbTimeouts.stepMs);
       console.log(
         '[mtp-webusb] open(): device.open() succeeded, opened =',
         device.opened,
@@ -326,7 +323,7 @@ const lib = {
       const wanted = device.configurations[0].configurationValue;
       console.log(`[mtp-webusb] open(): no active configuration, calling selectConfiguration(${wanted})`);
       try {
-        await mtp_with_timeout(device.selectConfiguration(wanted), USB_STEP_TIMEOUT_MS);
+        await mtp_with_timeout(device.selectConfiguration(wanted), usbTimeouts.stepMs);
         console.log('[mtp-webusb] open(): selectConfiguration succeeded');
       } catch (e) {
         // Some devices throw here while already usable; claimInterface below fails loudly if not.
@@ -340,7 +337,13 @@ const lib = {
     }
     return 0;
   },
-  js_usb_open__deps: ['$mtp_usb_registry', '$mtp_usb_set_last_error', '$mtp_with_timeout', '$libusb_errors'],
+  js_usb_open__deps: [
+    '$mtp_usb_registry',
+    '$mtp_usb_set_last_error',
+    '$mtp_with_timeout',
+    '$usbTimeouts',
+    '$libusb_errors',
+  ],
   js_usb_open__async: true,
 
   js_usb_close: async function (id: number): Promise<void> {
@@ -349,12 +352,12 @@ const lib = {
       return;
     }
     try {
-      await mtp_with_timeout(device.close(), USB_STEP_TIMEOUT_MS);
+      await mtp_with_timeout(device.close(), usbTimeouts.stepMs);
     } catch (e) {
       console.warn('[mtp-webusb] close() failed', e);
     }
   },
-  js_usb_close__deps: ['$mtp_usb_registry', '$mtp_with_timeout', '$libusb_errors'],
+  js_usb_close__deps: ['$mtp_usb_registry', '$mtp_with_timeout', '$usbTimeouts', '$libusb_errors'],
   js_usb_close__async: true,
 
   js_usb_set_configuration: async function (id: number, configValue: number): Promise<number> {
@@ -364,7 +367,7 @@ const lib = {
     }
     console.log(`[mtp-webusb] set_configuration(${configValue})`);
     try {
-      await mtp_with_timeout(device.selectConfiguration(configValue), USB_STEP_TIMEOUT_MS);
+      await mtp_with_timeout(device.selectConfiguration(configValue), usbTimeouts.stepMs);
       return 0;
     } catch (e) {
       mtp_usb_set_last_error(
@@ -378,6 +381,7 @@ const lib = {
     '$mtp_usb_live_device',
     '$mtp_usb_set_last_error',
     '$mtp_with_timeout',
+    '$usbTimeouts',
     '$libusb_errors',
   ],
   js_usb_set_configuration__async: true,
@@ -389,12 +393,12 @@ const lib = {
     }
     console.log(`[mtp-webusb] claimInterface(${ifaceNumber})`);
     try {
-      await mtp_with_timeout(device.claimInterface(ifaceNumber), USB_STEP_TIMEOUT_MS);
+      await mtp_with_timeout(device.claimInterface(ifaceNumber), usbTimeouts.stepMs);
       console.log(`[mtp-webusb] claimInterface(${ifaceNumber}) succeeded`);
       return 0;
     } catch (e) {
       if (e instanceof Error && e.message === 'timeout') {
-        mtp_usb_set_last_error(`claimInterface(${ifaceNumber}) timed out after ${USB_STEP_TIMEOUT_MS}ms`);
+        mtp_usb_set_last_error(`claimInterface(${ifaceNumber}) timed out after ${usbTimeouts.stepMs}ms`);
         return libusb_errors.IO;
       }
       mtp_usb_set_last_error(
@@ -410,6 +414,7 @@ const lib = {
     '$mtp_usb_live_device',
     '$mtp_usb_set_last_error',
     '$mtp_with_timeout',
+    '$usbTimeouts',
     '$libusb_errors',
   ],
   js_usb_claim_interface__async: true,
@@ -420,13 +425,19 @@ const lib = {
       return libusb_errors.NO_DEVICE;
     }
     try {
-      await mtp_with_timeout(device.releaseInterface(ifaceNumber), USB_STEP_TIMEOUT_MS);
+      await mtp_with_timeout(device.releaseInterface(ifaceNumber), usbTimeouts.stepMs);
       return 0;
     } catch {
       return libusb_errors.IO;
     }
   },
-  js_usb_release_interface__deps: ['$mtp_usb_registry', '$mtp_usb_live_device', '$mtp_with_timeout', '$libusb_errors'],
+  js_usb_release_interface__deps: [
+    '$mtp_usb_registry',
+    '$mtp_usb_live_device',
+    '$mtp_with_timeout',
+    '$usbTimeouts',
+    '$libusb_errors',
+  ],
   js_usb_release_interface__async: true,
 
   // Deliberately not guarded: a reset is what clears a poisoned transport.
@@ -437,14 +448,14 @@ const lib = {
       return libusb_errors.NO_DEVICE;
     }
     try {
-      await mtp_with_timeout(device.reset(), USB_RESET_TIMEOUT_MS);
+      await mtp_with_timeout(device.reset(), usbTimeouts.resetMs);
       registry.poisoned.delete(id);
       return 0;
     } catch {
       return libusb_errors.IO;
     }
   },
-  js_usb_reset_device__deps: ['$mtp_usb_registry', '$mtp_with_timeout', '$libusb_errors'],
+  js_usb_reset_device__deps: ['$mtp_usb_registry', '$mtp_with_timeout', '$usbTimeouts', '$libusb_errors'],
   js_usb_reset_device__async: true,
 
   js_usb_clear_halt: async function (id: number, endpointAddress: number): Promise<number> {
@@ -455,13 +466,19 @@ const lib = {
     const epNum = endpointAddress & 0x0f;
     const direction = endpointAddress & 0x80 ? 'in' : 'out';
     try {
-      await mtp_with_timeout(device.clearHalt(direction, epNum), USB_STEP_TIMEOUT_MS);
+      await mtp_with_timeout(device.clearHalt(direction, epNum), usbTimeouts.stepMs);
       return 0;
     } catch {
       return libusb_errors.IO;
     }
   },
-  js_usb_clear_halt__deps: ['$mtp_usb_registry', '$mtp_usb_live_device', '$mtp_with_timeout', '$libusb_errors'],
+  js_usb_clear_halt__deps: [
+    '$mtp_usb_registry',
+    '$mtp_usb_live_device',
+    '$mtp_with_timeout',
+    '$usbTimeouts',
+    '$libusb_errors',
+  ],
   js_usb_clear_halt__async: true,
 
   // Returns actual_length (>=0) on success, or a negative LIBUSB_ERROR_*.
@@ -476,14 +493,14 @@ const lib = {
     if (!device) {
       return libusb_errors.NO_DEVICE;
     }
-    const waitMs = timeoutMs || USB_BULK_MAX_TIMEOUT_MS;
+    const waitMs = timeoutMs || usbTimeouts.bulkMaxMs;
     const epNum = endpointAddress & 0x0f;
     try {
       if (endpointAddress & 0x80) {
         const result = await mtp_with_timeout(device.transferIn(epNum, length), waitMs);
         if (result.status === 'stall') {
           console.warn(`[mtp-webusb] bulk IN ep=0x${endpointAddress.toString(16)} stalled, clearing halt`);
-          await mtp_with_timeout(device.clearHalt('in', epNum), USB_STEP_TIMEOUT_MS);
+          await mtp_with_timeout(device.clearHalt('in', epNum), usbTimeouts.stepMs);
           return libusb_errors.PIPE;
         }
         const view = new Uint8Array(result.data!.buffer, result.data!.byteOffset, result.data!.byteLength);
@@ -494,7 +511,7 @@ const lib = {
         const result = await mtp_with_timeout(device.transferOut(epNum, view), waitMs);
         if (result.status === 'stall') {
           console.warn(`[mtp-webusb] bulk OUT ep=0x${endpointAddress.toString(16)} stalled, clearing halt`);
-          await mtp_with_timeout(device.clearHalt('out', epNum), USB_STEP_TIMEOUT_MS);
+          await mtp_with_timeout(device.clearHalt('out', epNum), usbTimeouts.stepMs);
           return libusb_errors.PIPE;
         }
         return result.bytesWritten ?? 0;
@@ -519,6 +536,7 @@ const lib = {
     '$mtp_usb_live_device',
     '$mtp_usb_set_last_error',
     '$mtp_with_timeout',
+    '$usbTimeouts',
     '$libusb_errors',
   ],
   js_usb_bulk_transfer__async: true,
@@ -547,7 +565,7 @@ const lib = {
       value: wValue,
       index: wIndex,
     };
-    const waitMs = timeoutMs || USB_CONTROL_TIMEOUT_MS;
+    const waitMs = timeoutMs || usbTimeouts.controlMs;
     try {
       if (bmRequestType & 0x80) {
         const result = await mtp_with_timeout(device.controlTransferIn(setup, wLength), waitMs);
@@ -591,6 +609,7 @@ const lib = {
     '$mtp_usb_live_device',
     '$mtp_usb_set_last_error',
     '$mtp_with_timeout',
+    '$usbTimeouts',
     '$libusb_errors',
   ],
   js_usb_control_transfer__async: true,

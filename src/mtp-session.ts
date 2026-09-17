@@ -24,7 +24,7 @@ const DETECT_NO_MTP_DEVICE_RESULT = -6;
 const PTP_OC_GET_PARTIAL_OBJECT = 0x101b;
 /** Matches the op libmtp's LIBMTP_SendPartialObject sends (Android extension). */
 const PTP_OC_ANDROID_SEND_PARTIAL_OBJECT = 0x95c2;
-/** The device reports this object handle is gone (deleted on-device); permanent, unlike a transport hiccup. */
+/** PTP_RC_InvalidObjectHandle. */
 const PTP_RC_INVALID_OBJECT_HANDLE = 0x2009;
 
 const DEFAULT_OPEN_TIMEOUT_MS = 30000;
@@ -88,7 +88,6 @@ export interface MtpFileRef {
 
 export interface MtpSessionOpenOptions {
   isVerboseLogging: boolean;
-  /** Relative strings resolve against the page (or worker) location. */
   wasmUrl?: string | URL;
   /** Overall deadline for detect + open + the first storage walk; defaults to 30000. */
   openTimeoutMs?: number;
@@ -103,7 +102,6 @@ export class MtpSession {
   readonly storages: MtpStorageInfo[];
   private readonly mtp: MtpEmscriptenModule;
   private readonly devicePointer: number;
-  /** The USBDevice libmtp claimed, when identifiable; anchors the disconnect watcher. */
   private readonly usbDevice: USBDevice | undefined;
   private isClosed = false;
   private isAborted = false;
@@ -151,8 +149,7 @@ export class MtpSession {
       if (!isTimeoutError(error)) {
         throw error;
       }
-      // The suspended open cannot be cancelled, so the wasm instance (and its
-      // half-open device state) is abandoned rather than reused.
+      // A suspended open cannot be cancelled; the wasm instance is abandoned, not reused.
       invalidateMtpModule();
       await releaseRegistryDevices(mtp, [
         (device) => withTimeoutMs(device.reset(), DEVICE_RESET_TIMEOUT_MS),
@@ -166,9 +163,8 @@ export class MtpSession {
   }
 
   /**
-   * Releases the device; all subsequent operations reject with MtpSessionClosedError. A
-   * graceful release that exceeds SESSION_CLOSE_TIMEOUT_MS falls back to closing the
-   * USB device directly, so close() always settles.
+   * Releases the device; all subsequent operations reject with MtpSessionClosedError.
+   * A graceful release that exceeds 10 s falls back to closing the USB device directly.
    */
   async close(): Promise<void> {
     if (this.isClosed) {
@@ -191,16 +187,17 @@ export class MtpSession {
           '(abort() additionally resets a wedged device)',
       );
       await releaseRegistryDevices(this.mtp, [(device) => withTimeoutMs(device.close(), DEVICE_CLOSE_TIMEOUT_MS)]);
+      // Stale queued ops may still run here; a new session must not share the instance.
+      invalidateMtpModule();
     } finally {
       navigator.usb.removeEventListener('disconnect', this.onUsbDisconnect);
     }
   }
 
   /**
-   * Hard-releases a wedged device so a follow-up requestMtpFileSystem() succeeds without
-   * replugging: queued operations reject, in-flight ones are cut off at the next transfer,
-   * and the device is reset when the graceful release does not finish in time. Never
-   * rejects; existing handles become unusable either way.
+   * Hard-releases a wedged device, resetting it when needed, so a fresh
+   * requestMtpFileSystem() recovers without replugging. Never rejects; all
+   * handles become unusable.
    */
   async abort(): Promise<void> {
     if (this.isClosed) {
@@ -310,7 +307,7 @@ export class MtpSession {
     if (!registry) {
       return;
     }
-    // The claimed-device snapshot is authoritative; without it any registry device counts as ours.
+    // Without a claimed-device snapshot, any registry device is treated as ours.
     if (this.usbDevice !== undefined && event.device !== this.usbDevice) {
       return;
     }
@@ -374,7 +371,7 @@ export class MtpSession {
       }
       await writer.close();
     } catch (error) {
-      const reason = error instanceof Error ? error : new Error(String(error));
+      const reason = this.disconnectError ?? (error instanceof Error ? error : new Error(String(error)));
       await writer.abort(reason).catch(() => undefined);
     }
   }
@@ -622,7 +619,14 @@ export async function loadMtpModule(wasmUrl?: string | URL): Promise<MtpEmscript
 
 async function loadModule(): Promise<MtpEmscriptenModule> {
   if (!modulePromise) {
-    modulePromise = importMtpModule();
+    const load = importMtpModule();
+    // A failed instantiate must not poison every later open until page reload.
+    load.catch(() => {
+      if (modulePromise === load) {
+        modulePromise = null;
+      }
+    });
+    modulePromise = load;
   }
   return modulePromise;
 }
@@ -661,7 +665,7 @@ function findClaimedRegistryDevice(mtp: MtpEmscriptenModule): USBDevice | undefi
   return mtp.mtpUsb?.devices.find((device) => device?.opened === true);
 }
 
-/** Runs the given per-device steps (bounded, failure-ignoring) and drops the registry entries. */
+/** Runs each step best-effort, then drops the registry entries. */
 async function releaseRegistryDevices(
   mtp: MtpEmscriptenModule,
   steps: ((device: USBDevice) => Promise<void>)[],
@@ -676,13 +680,17 @@ async function releaseRegistryDevices(
       continue;
     }
     for (const step of steps) {
-      await step(device).catch(() => undefined);
+      try {
+        await step(device);
+      } catch {
+        // Best-effort by contract: this recovery path must never reject.
+      }
     }
     delete registry.devices[id];
   }
 }
 
-/** Races promise against a deadline; a late settlement of the losing promise stays handled. */
+/** The losing promise's late settlement stays handled. */
 function withTimeoutMs<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   promise.catch(() => undefined);
   return Promise.race([

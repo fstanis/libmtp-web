@@ -1,6 +1,6 @@
 {
   "name": "libmtp-web",
-  "version": "0.1.1+1.1.23",
+  "version": "0.1.2+1.1.23",
   "description": "libmtp compiled to WebAssembly: MTP device access over WebUSB, exposed through a File System Access API-shaped handle interface",
   "license": "LGPL-2.1",
   "repository": {

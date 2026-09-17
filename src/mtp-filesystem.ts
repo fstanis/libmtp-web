@@ -50,10 +50,7 @@ export class MtpFileSystem {
     await this.session.close();
   }
 
-  /**
-   * Hard-releases a wedged device (bounded, never rejects) and resets it, so a fresh
-   * requestMtpFileSystem() recovers without replugging. All handles become unusable.
-   */
+  /** Hard-releases a wedged device so a fresh requestMtpFileSystem() recovers without replugging. */
   async abort(): Promise<void> {
     await this.session.abort();
   }
