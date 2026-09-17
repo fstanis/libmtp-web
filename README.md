@@ -26,6 +26,8 @@ const filters = await mtpDeviceFilters({ wasmUrl });
 const fileSystem = await requestMtpFileSystem({ wasmUrl });
 ```
 
+Relative `wasmUrl` strings resolve against the page URL, so the value a bundler emits for the import above works as-is.
+
 Anything else (esbuild, no bundler): host `dist/mtp.wasm` same-origin and pass `{ wasmUrl }` to `mtpDeviceFilters()` and `requestMtpFileSystem()`.
 
 ```ts
@@ -48,6 +50,19 @@ await videoFile.stream().pipeTo(writable);
 
 await storage.removeEntry('video.mp4');
 await fileSystem.close();
+```
+
+## Ranged reads
+
+Where the device supports it (`device.supportsRangeReads`), `readRange(offset, length)` fetches any slice without streaming the rest — one small read is enough for tags, and a trailing index (an MP4 `moov` atom) can be sought from `handle.size`. Offsets address the first 4 GiB; `handle.lastModified` is also exposed.
+
+## Error handling
+
+Failures throw typed errors. `MtpObjectNotFoundError` (object deleted on-device) and `MtpDeviceDisconnectedError` (device unplugged) are permanent — don't retry them; `MtpFileReadError` and `MtpWriteError` may be transient and carry the PTP response `code` when the device reported one. Recover a wedged session without replugging:
+
+```ts
+await fileSystem.abort();
+fileSystem = await requestMtpFileSystem();
 ```
 
 ## Building from source

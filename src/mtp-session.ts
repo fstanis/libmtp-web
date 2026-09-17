@@ -6,6 +6,8 @@ import {
   MtpFileReadError,
   MtpWriteError,
   MtpSessionClosedError,
+  MtpDeviceDisconnectedError,
+  MtpObjectNotFoundError,
 } from './mtp-errors.js';
 import type { MtpEmscriptenModule } from './mtp-module.js';
 
@@ -17,6 +19,19 @@ export const MTP_ROOT_FOLDER_ID = 0xffffffff;
 
 /** mtp_detect_raw_devices' encoding of LIBMTP_ERROR_NO_DEVICE_ATTACHED (5). */
 const DETECT_NO_MTP_DEVICE_RESULT = -6;
+
+/** Matches the op libmtp's LIBMTP_GetPartialObject sends. */
+const PTP_OC_GET_PARTIAL_OBJECT = 0x101b;
+/** Matches the op libmtp's LIBMTP_SendPartialObject sends (Android extension). */
+const PTP_OC_ANDROID_SEND_PARTIAL_OBJECT = 0x95c2;
+/** The device reports this object handle is gone (deleted on-device); permanent, unlike a transport hiccup. */
+const PTP_RC_INVALID_OBJECT_HANDLE = 0x2009;
+
+const DEFAULT_OPEN_TIMEOUT_MS = 30000;
+const SESSION_CLOSE_TIMEOUT_MS = 10000;
+const ABORT_RELEASE_TIMEOUT_MS = 5000;
+const DEVICE_RESET_TIMEOUT_MS = 10000;
+const DEVICE_CLOSE_TIMEOUT_MS = 5000;
 
 // emcc promising-wraps only main; these exports must be wrapped by hand or
 // ccall(..., { async: true }) throws SuspendError on first suspension.
@@ -34,11 +49,6 @@ const SUSPENDING_EXPORTS = [
   'mtp_create_folder',
   'mtp_delete_object',
 ];
-
-/** Matches the op libmtp's LIBMTP_GetPartialObject sends. */
-const PTP_OC_GET_PARTIAL_OBJECT = 0x101b;
-/** Matches the op libmtp's LIBMTP_SendPartialObject sends (Android extension). */
-const PTP_OC_ANDROID_SEND_PARTIAL_OBJECT = 0x95c2;
 
 /** Bytes queued toward the consumer before the device read loop suspends. */
 const READ_WINDOW_BYTES = 8 * 1024 * 1024;
@@ -76,6 +86,14 @@ export interface MtpFileRef {
   size: number;
 }
 
+export interface MtpSessionOpenOptions {
+  isVerboseLogging: boolean;
+  /** Relative strings resolve against the page (or worker) location. */
+  wasmUrl?: string | URL;
+  /** Overall deadline for detect + open + the first storage walk; defaults to 30000. */
+  openTimeoutMs?: number;
+}
+
 let modulePromise: Promise<MtpEmscriptenModule> | null = null;
 /** wasmUrl from the last open; locateFile falls back to this module's URL when null. */
 let moduleWasmUrl: string | null = null;
@@ -85,24 +103,30 @@ export class MtpSession {
   readonly storages: MtpStorageInfo[];
   private readonly mtp: MtpEmscriptenModule;
   private readonly devicePointer: number;
+  /** The USBDevice libmtp claimed, when identifiable; anchors the disconnect watcher. */
+  private readonly usbDevice: USBDevice | undefined;
   private isClosed = false;
+  private isAborted = false;
+  private disconnectError: MtpDeviceDisconnectedError | null = null;
   // libmtp is not reentrant: device requests run one at a time.
   private deviceQueue: Promise<unknown> = Promise.resolve();
 
   private constructor(
     mtp: MtpEmscriptenModule,
     devicePointer: number,
+    usbDevice: USBDevice | undefined,
     device: MtpDeviceSummary,
     storages: MtpStorageInfo[],
   ) {
     this.mtp = mtp;
     this.devicePointer = devicePointer;
+    this.usbDevice = usbDevice;
     this.device = device;
     this.storages = storages;
   }
 
-  /** Loads the wasm module and opens the first paired device. */
-  static async open(options: { isVerboseLogging: boolean; wasmUrl: string }): Promise<MtpSession> {
+  /** Loads the wasm module and opens the first paired device; always settles within openTimeoutMs. */
+  static async open(options: MtpSessionOpenOptions): Promise<MtpSession> {
     const mtp = await loadMtpModule(options.wasmUrl);
     mtp.ccall(
       'mtp_set_debug_level',
@@ -111,70 +135,99 @@ export class MtpSession {
       [options.isVerboseLogging ? LIBMTP_DEBUG_ALL : LIBMTP_DEBUG_NONE],
     );
 
-    console.log('[mtp] detecting raw devices...');
-    const rawDeviceCount = await callNumberAsync(mtp, 'mtp_detect_raw_devices', []);
-    console.log(`[mtp] mtp_detect_raw_devices: result=${rawDeviceCount}`);
-    if (rawDeviceCount === DETECT_NO_MTP_DEVICE_RESULT) {
-      // libmtp returns the same code for "nothing paired" and "paired but not MTP".
-      const pairedCount = (await navigator.usb.getDevices()).length;
-      throw new MtpDeviceNotFoundError(
-        pairedCount === 0
-          ? 'No paired MTP device found. Pair a device first.'
-          : 'A paired USB device was found but none presented an MTP interface. The device may not be in MTP mode.',
+    const timeoutMs = options.openTimeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS;
+    try {
+      const opened = await withTimeoutMs(openPairedDevice(mtp), timeoutMs);
+      const session = new MtpSession(
+        opened.mtp,
+        opened.devicePointer,
+        opened.usbDevice,
+        opened.device,
+        opened.storages,
       );
-    }
-    if (rawDeviceCount <= 0) {
-      throw new MtpDeviceNotFoundError(`MTP device detection failed (libmtp error ${-(rawDeviceCount + 1)}).`);
-    }
-
-    const devicePointer = await callNumberAsync(mtp, 'mtp_open_raw_device', [0]);
-    if (!devicePointer) {
-      const detail = lastWebUsbError(mtp);
+      navigator.usb.addEventListener('disconnect', session.onUsbDisconnect);
+      return session;
+    } catch (error) {
+      if (!isTimeoutError(error)) {
+        throw error;
+      }
+      // The suspended open cannot be cancelled, so the wasm instance (and its
+      // half-open device state) is abandoned rather than reused.
+      invalidateMtpModule();
+      await releaseRegistryDevices(mtp, [
+        (device) => withTimeoutMs(device.reset(), DEVICE_RESET_TIMEOUT_MS),
+        (device) => withTimeoutMs(device.close(), DEVICE_CLOSE_TIMEOUT_MS),
+      ]);
       throw new MtpOpenError(
-        detail
-          ? `Could not open the MTP device: ${detail}`
-          : 'Could not open the MTP device. Check the browser console for details.',
+        `Opening the MTP device did not complete within ${timeoutMs}ms; the transport may be wedged. ` +
+          'A retry starts from a fresh module.',
       );
     }
-    console.log('[mtp] device opened successfully');
-
-    const friendlyName = takeOwnedString(mtp, await callNumberAsync(mtp, 'mtp_friendlyname', [devicePointer])) ?? '';
-    const modelName = takeOwnedString(mtp, await callNumberAsync(mtp, 'mtp_modelname', [devicePointer])) ?? '';
-
-    const supportsRangeReads =
-      callNumber(mtp, 'mtp_device_supports_operation', [devicePointer, PTP_OC_GET_PARTIAL_OBJECT]) !== 0;
-    const supportsRangeWrites =
-      callNumber(mtp, 'mtp_device_supports_operation', [devicePointer, PTP_OC_ANDROID_SEND_PARTIAL_OBJECT]) !== 0;
-    console.log(`[mtp] capabilities: rangeReads=${supportsRangeReads} rangeWrites=${supportsRangeWrites}`);
-
-    const storageRc = await callNumberAsync(mtp, 'mtp_get_storage', [devicePointer]);
-    console.log(`[mtp] mtp_get_storage: rc=${storageRc}`);
-
-    const storages: MtpStorageInfo[] = [];
-    let storagePointer = callNumber(mtp, 'mtp_storage_first', [devicePointer]);
-    while (storagePointer) {
-      const storageId = callNumber(mtp, 'mtp_storage_id', [storagePointer]) >>> 0;
-      const description = readBorrowedString(mtp, callNumber(mtp, 'mtp_storage_description', [storagePointer]));
-      console.log(`[mtp] storage id=${storageId} (${description})`);
-      storages.push({ storageId, name: description || `Storage ${storageId}` });
-      storagePointer = callNumber(mtp, 'mtp_storage_next', [storagePointer]);
-    }
-
-    return new MtpSession(
-      mtp,
-      devicePointer,
-      { friendlyName, modelName, supportsRangeReads, supportsRangeWrites },
-      storages,
-    );
   }
 
-  /** Releases the device; all subsequent operations reject with MtpSessionClosedError. */
+  /**
+   * Releases the device; all subsequent operations reject with MtpSessionClosedError. A
+   * graceful release that exceeds SESSION_CLOSE_TIMEOUT_MS falls back to closing the
+   * USB device directly, so close() always settles.
+   */
   async close(): Promise<void> {
     if (this.isClosed) {
       return;
     }
     this.isClosed = true;
-    await this.serialize(() => callNumberAsync(this.mtp, 'mtp_release_device', [this.devicePointer]));
+    try {
+      await withTimeoutMs(
+        this.serialize(() => callNumberAsync(this.mtp, 'mtp_release_device', [this.devicePointer]), {
+          isTeardown: true,
+        }),
+        SESSION_CLOSE_TIMEOUT_MS,
+      );
+    } catch (error) {
+      if (!isTimeoutError(error)) {
+        throw error;
+      }
+      console.warn(
+        `[mtp] close timed out after ${SESSION_CLOSE_TIMEOUT_MS}ms; forcing the device release ` +
+          '(abort() additionally resets a wedged device)',
+      );
+      await releaseRegistryDevices(this.mtp, [(device) => withTimeoutMs(device.close(), DEVICE_CLOSE_TIMEOUT_MS)]);
+    } finally {
+      navigator.usb.removeEventListener('disconnect', this.onUsbDisconnect);
+    }
+  }
+
+  /**
+   * Hard-releases a wedged device so a follow-up requestMtpFileSystem() succeeds without
+   * replugging: queued operations reject, in-flight ones are cut off at the next transfer,
+   * and the device is reset when the graceful release does not finish in time. Never
+   * rejects; existing handles become unusable either way.
+   */
+  async abort(): Promise<void> {
+    if (this.isClosed) {
+      return;
+    }
+    this.isAborted = true;
+    this.isClosed = true;
+    navigator.usb.removeEventListener('disconnect', this.onUsbDisconnect);
+    const gracefulRelease = this.serialize(
+      () => callNumberAsync(this.mtp, 'mtp_release_device', [this.devicePointer]),
+      {
+        isTeardown: true,
+      },
+    ).then(
+      () => true,
+      () => false,
+    );
+    const isGracefulReleaseDone = await withTimeoutMs(gracefulRelease, ABORT_RELEASE_TIMEOUT_MS).catch(() => false);
+    if (isGracefulReleaseDone) {
+      return;
+    }
+    console.warn(`[mtp] abort: graceful release did not finish within ${ABORT_RELEASE_TIMEOUT_MS}ms; forcing it`);
+    await releaseRegistryDevices(this.mtp, [
+      (device) => withTimeoutMs(device.reset(), DEVICE_RESET_TIMEOUT_MS),
+      (device) => withTimeoutMs(device.close(), DEVICE_CLOSE_TIMEOUT_MS),
+    ]);
+    invalidateMtpModule();
   }
 
   listChildren(storageId: number, folderId: number): Promise<MtpEntryInfo[]> {
@@ -242,19 +295,58 @@ export class MtpSession {
       const result = await callNumberAsync(this.mtp, 'mtp_delete_object', [this.devicePointer, objectId]);
       console.log(`[mtp] mtp_delete_object: rc=${result}`);
       if (result !== 0) {
-        throw newWriteError(this.mtp, `Could not remove "${name}" from the device`);
+        throw deviceOperationError(
+          this.mtp,
+          MtpWriteError,
+          `Could not remove "${name}" from the device`,
+          lastPtpResponse(this.mtp),
+        );
       }
     });
   }
 
+  private readonly onUsbDisconnect = (event: USBConnectionEvent): void => {
+    const registry = this.mtp.mtpUsb;
+    if (!registry) {
+      return;
+    }
+    // The claimed-device snapshot is authoritative; without it any registry device counts as ours.
+    if (this.usbDevice !== undefined && event.device !== this.usbDevice) {
+      return;
+    }
+    let wasDeviceRegistered = false;
+    for (let id = 0; id < registry.devices.length; id++) {
+      if (registry.devices[id] === event.device) {
+        delete registry.devices[id];
+        wasDeviceRegistered = true;
+      }
+    }
+    if (wasDeviceRegistered) {
+      this.disconnectError = new MtpDeviceDisconnectedError('The MTP device was unplugged.');
+    }
+  };
+
   private assertOpen(): void {
+    if (this.disconnectError) {
+      throw this.disconnectError;
+    }
     if (this.isClosed) {
       throw new MtpSessionClosedError('The MTP device session is closed.');
     }
   }
 
-  private serialize<T>(action: () => Promise<T>): Promise<T> {
-    const result = this.deviceQueue.then(action);
+  private serialize<T>(action: () => Promise<T>, options?: { isTeardown?: boolean }): Promise<T> {
+    const result = this.deviceQueue.then(async () => {
+      if (!options?.isTeardown) {
+        if (this.disconnectError) {
+          throw this.disconnectError;
+        }
+        if (this.isAborted) {
+          throw new MtpSessionClosedError('The MTP device session was aborted.');
+        }
+      }
+      return action();
+    });
     this.deviceQueue = result.then(
       () => undefined,
       () => undefined,
@@ -306,7 +398,12 @@ export class MtpSession {
         lengthSlot,
       ]);
       if (result !== 0) {
-        throw new MtpFileReadError(`Could not read "${file.name}" from the device at offset ${offset}.`);
+        throw deviceOperationError(
+          mtp,
+          MtpFileReadError,
+          `Could not read "${file.name}" from the device at offset ${offset}`,
+          lastPtpResponse(mtp),
+        );
       }
       const bufferPointer = mtp.HEAP32[pointerSlot >> 2] >>> 0;
       const byteLength = mtp.HEAP32[lengthSlot >> 2] >>> 0;
@@ -416,7 +513,12 @@ export class MtpSession {
       console.log(`[mtp] replacing object ${child.id} ("${fileName}")`);
       const result = await callNumberAsync(this.mtp, 'mtp_delete_object', [this.devicePointer, child.id]);
       if (result !== 0) {
-        throw newWriteError(this.mtp, `Could not replace "${fileName}" on the device`);
+        throw deviceOperationError(
+          this.mtp,
+          MtpWriteError,
+          `Could not replace "${fileName}" on the device`,
+          lastPtpResponse(this.mtp),
+        );
       }
     }
   }
@@ -445,11 +547,76 @@ export class MtpSession {
   }
 }
 
-/** Loads (and caches) the wasm module without opening a device; MtpSession.open and mtpDeviceFilters() share it. */
-export async function loadMtpModule(wasmUrl?: string): Promise<MtpEmscriptenModule> {
-  if (wasmUrl !== undefined) {
-    moduleWasmUrl = wasmUrl;
+interface OpenedMtpDevice {
+  mtp: MtpEmscriptenModule;
+  devicePointer: number;
+  usbDevice: USBDevice | undefined;
+  device: MtpDeviceSummary;
+  storages: MtpStorageInfo[];
+}
+
+async function openPairedDevice(mtp: MtpEmscriptenModule): Promise<OpenedMtpDevice> {
+  console.log('[mtp] detecting raw devices...');
+  const rawDeviceCount = await callNumberAsync(mtp, 'mtp_detect_raw_devices', []);
+  console.log(`[mtp] mtp_detect_raw_devices: result=${rawDeviceCount}`);
+  if (rawDeviceCount === DETECT_NO_MTP_DEVICE_RESULT) {
+    // libmtp returns the same code for "nothing paired" and "paired but not MTP".
+    const pairedCount = (await navigator.usb.getDevices()).length;
+    throw new MtpDeviceNotFoundError(
+      pairedCount === 0
+        ? 'No paired MTP device found. Pair a device first.'
+        : 'A paired USB device was found but none presented an MTP interface. The device may not be in MTP mode.',
+    );
   }
+  if (rawDeviceCount <= 0) {
+    throw new MtpDeviceNotFoundError(`MTP device detection failed (libmtp error ${-(rawDeviceCount + 1)}).`);
+  }
+
+  const devicePointer = await callNumberAsync(mtp, 'mtp_open_raw_device', [0]);
+  if (!devicePointer) {
+    const detail = lastWebUsbError(mtp);
+    throw new MtpOpenError(
+      detail
+        ? `Could not open the MTP device: ${detail}`
+        : 'Could not open the MTP device. Check the browser console for details.',
+    );
+  }
+  console.log('[mtp] device opened successfully');
+
+  const friendlyName = takeOwnedString(mtp, await callNumberAsync(mtp, 'mtp_friendlyname', [devicePointer])) ?? '';
+  const modelName = takeOwnedString(mtp, await callNumberAsync(mtp, 'mtp_modelname', [devicePointer])) ?? '';
+
+  const supportsRangeReads =
+    callNumber(mtp, 'mtp_device_supports_operation', [devicePointer, PTP_OC_GET_PARTIAL_OBJECT]) !== 0;
+  const supportsRangeWrites =
+    callNumber(mtp, 'mtp_device_supports_operation', [devicePointer, PTP_OC_ANDROID_SEND_PARTIAL_OBJECT]) !== 0;
+  console.log(`[mtp] capabilities: rangeReads=${supportsRangeReads} rangeWrites=${supportsRangeWrites}`);
+
+  const storageRc = await callNumberAsync(mtp, 'mtp_get_storage', [devicePointer]);
+  console.log(`[mtp] mtp_get_storage: rc=${storageRc}`);
+
+  const storages: MtpStorageInfo[] = [];
+  let storagePointer = callNumber(mtp, 'mtp_storage_first', [devicePointer]);
+  while (storagePointer) {
+    const storageId = callNumber(mtp, 'mtp_storage_id', [storagePointer]) >>> 0;
+    const description = readBorrowedString(mtp, callNumber(mtp, 'mtp_storage_description', [storagePointer]));
+    console.log(`[mtp] storage id=${storageId} (${description})`);
+    storages.push({ storageId, name: description || `Storage ${storageId}` });
+    storagePointer = callNumber(mtp, 'mtp_storage_next', [storagePointer]);
+  }
+
+  return {
+    mtp,
+    devicePointer,
+    usbDevice: findClaimedRegistryDevice(mtp),
+    device: { friendlyName, modelName, supportsRangeReads, supportsRangeWrites },
+    storages,
+  };
+}
+
+/** Loads (and caches) the wasm module without opening a device; MtpSession.open and mtpDeviceFilters() share it. */
+export async function loadMtpModule(wasmUrl?: string | URL): Promise<MtpEmscriptenModule> {
+  moduleWasmUrl = resolveWasmUrl(wasmUrl);
   return loadModule();
 }
 
@@ -470,6 +637,62 @@ async function importMtpModule(): Promise<MtpEmscriptenModule> {
     mtp['_' + exportName] = WebAssembly.promising(wasmExport);
   }
   return mtp;
+}
+
+function invalidateMtpModule(): void {
+  modulePromise = null;
+  moduleWasmUrl = null;
+}
+
+/** Relative strings resolve against the page (or worker) location; URL instances pass through. */
+function resolveWasmUrl(wasmUrl: string | URL | undefined): string {
+  if (wasmUrl instanceof URL) {
+    return wasmUrl.href;
+  }
+  if (wasmUrl === undefined) {
+    // The new URL asset reference makes Webpack/Vite copy the wasm into the app's output.
+    return new URL('./mtp.wasm', import.meta.url).href;
+  }
+  const base = typeof document === 'undefined' ? self.location.href : document.baseURI;
+  return new URL(wasmUrl, base).href;
+}
+
+function findClaimedRegistryDevice(mtp: MtpEmscriptenModule): USBDevice | undefined {
+  return mtp.mtpUsb?.devices.find((device) => device?.opened === true);
+}
+
+/** Runs the given per-device steps (bounded, failure-ignoring) and drops the registry entries. */
+async function releaseRegistryDevices(
+  mtp: MtpEmscriptenModule,
+  steps: ((device: USBDevice) => Promise<void>)[],
+): Promise<void> {
+  const registry = mtp.mtpUsb;
+  if (!registry) {
+    return;
+  }
+  for (const id of registry.order) {
+    const device = registry.devices[id];
+    if (!device) {
+      continue;
+    }
+    for (const step of steps) {
+      await step(device).catch(() => undefined);
+    }
+    delete registry.devices[id];
+  }
+}
+
+/** Races promise against a deadline; a late settlement of the losing promise stays handled. */
+function withTimeoutMs<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  promise.catch(() => undefined);
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), timeoutMs)),
+  ]);
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error && error.message === 'timeout';
 }
 
 function callNumber(mtp: MtpEmscriptenModule, exportName: string, args: number[]): number {
@@ -524,9 +747,27 @@ function allocUtf8(mtp: MtpEmscriptenModule, text: string): number {
   return pointer;
 }
 
-function newWriteError(mtp: MtpEmscriptenModule, message: string): MtpWriteError {
+/** code must come from the op that just failed (mtp_read_file_range / mtp_delete_object); 0 means none. */
+function deviceOperationError(
+  mtp: MtpEmscriptenModule,
+  errorClass: new (message: string, code?: number) => Error,
+  message: string,
+  code: number,
+): Error {
+  if (code === PTP_RC_INVALID_OBJECT_HANDLE) {
+    return new MtpObjectNotFoundError(`${message}: the device reports the object no longer exists.`, code);
+  }
   const detail = lastWebUsbError(mtp);
-  return new MtpWriteError(detail ? `${message}: ${detail}` : `${message}.`);
+  const suffixed = detail ? `${message}: ${detail}` : `${message}.`;
+  return new errorClass(suffixed, code || undefined);
+}
+
+function newWriteError(mtp: MtpEmscriptenModule, message: string): MtpWriteError {
+  return deviceOperationError(mtp, MtpWriteError, message, 0);
+}
+
+function lastPtpResponse(mtp: MtpEmscriptenModule): number {
+  return callNumber(mtp, 'mtp_last_ptp_response', []) >>> 0;
 }
 
 /** Returns the message of the last WebUSB failure, or "" if none was recorded. */

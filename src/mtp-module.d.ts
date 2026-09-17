@@ -16,5 +16,10 @@ export interface MtpEmscriptenModule {
   mtpStreamPuller?: (target: Uint8Array) => Promise<number>;
   /** Registered by the session for the duration of mtp_read_file_stream; the js_stream_push import calls it. */
   mtpStreamPusher?: (chunk: Uint8Array) => Promise<void>;
+  /** Runtime state the wasm imports keep; the session clears entries on disconnect and forced release. */
+  mtpUsb?: {
+    devices: (USBDevice | undefined)[];
+    order: number[];
+  };
   [wasmExport: string]: unknown;
 }

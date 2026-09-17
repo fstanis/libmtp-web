@@ -10,6 +10,7 @@
 static int g_initialized = 0;
 static LIBMTP_raw_device_t *g_raw_devices = NULL;
 static int g_num_raw_devices = 0;
+static unsigned short g_last_ptp_response = 0;
 
 EMSCRIPTEN_KEEPALIVE
 void mtp_set_debug_level(int level) {
@@ -179,22 +180,33 @@ int mtp_supported_vendor_ids(unsigned short *out, int capacity) {
 }
 
 /* *out_data is NULL only for an empty range (at/past end-of-file). Returns 0
- * on success. The offset is split because the PTP op libmtp sends is 32-bit.
- * Free *out_data with mtp_free_file_buffer(). */
+ * on success. Speaks ptp_getpartialobject directly so the PTP response code
+ * is captured for mtp_last_ptp_response(); the hi offset word is accepted
+ * for signature stability but the standard op is 32-bit. Free *out_data with
+ * mtp_free_file_buffer(). */
 EMSCRIPTEN_KEEPALIVE
 int mtp_read_file_range(LIBMTP_mtpdevice_t *device, unsigned int file_id,
                         unsigned int offset_lo, unsigned int offset_hi,
                         unsigned int length, unsigned char **out_data, unsigned int *out_length) {
+  (void)offset_hi;
   *out_data = NULL;
   *out_length = 0;
-  uint64_t offset = ((uint64_t)offset_hi << 32) | offset_lo;
-  int result = LIBMTP_GetPartialObject(device, file_id, offset, length, out_data, out_length);
-  if (result != 0) {
+  unsigned short response =
+      ptp_getpartialobject((PTPParams *)device->params, file_id, offset_lo, length, out_data, out_length);
+  g_last_ptp_response = response;
+  if (response != PTP_RC_OK) {
     free(*out_data);
     *out_data = NULL;
     *out_length = 0;
   }
-  return result;
+  return response == PTP_RC_OK ? 0 : -1;
+}
+
+/* PTP response code from the last mtp_read_file_range/mtp_delete_object;
+ * PTP_RC_OK after a successful call. */
+EMSCRIPTEN_KEEPALIVE
+int mtp_last_ptp_response(void) {
+  return g_last_ptp_response;
 }
 
 /* Implemented in src/webusb-async.lib.ts; suspends through JSPI while the
@@ -301,7 +313,12 @@ uint32_t mtp_create_folder(LIBMTP_mtpdevice_t *device, unsigned int storage_id, 
   return LIBMTP_Create_Folder(device, (char *)name, parent_id, storage_id);
 }
 
+/* Returns 0 on success. Speaks ptp_deleteobject directly so the PTP response
+ * code is captured for mtp_last_ptp_response(); 0 is the ofc the PTP spec
+ * mandates for DeleteObject. */
 EMSCRIPTEN_KEEPALIVE
 int mtp_delete_object(LIBMTP_mtpdevice_t *device, unsigned int object_id) {
-  return LIBMTP_Delete_Object(device, object_id);
+  unsigned short response = ptp_deleteobject((PTPParams *)device->params, object_id, 0);
+  g_last_ptp_response = response;
+  return response == PTP_RC_OK ? 0 : -1;
 }

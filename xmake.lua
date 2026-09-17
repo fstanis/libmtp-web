@@ -115,7 +115,8 @@ target("mtpwasm")
             "\"_mtp_read_file_range\",\"_mtp_read_file_stream\",\"_mtp_device_supports_operation\"," ..
             "\"_mtp_supported_vendor_ids\"," ..
             "\"_mtp_send_file_stream\",\"_mtp_create_folder\",\"_mtp_delete_object\"," ..
-            "\"_mtp_file_destroy\",\"_mtp_free_string\",\"_webusb_get_last_error\"" ..
+            "\"_mtp_file_destroy\",\"_mtp_free_string\",\"_mtp_last_ptp_response\"," ..
+            "\"_webusb_get_last_error\"" ..
         "]",
         "--js-library=" .. jslib_file,
         "--no-entry",

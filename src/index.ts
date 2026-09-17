@@ -15,5 +15,7 @@ export {
   MtpFileReadError,
   MtpWriteError,
   MtpSessionClosedError,
+  MtpDeviceDisconnectedError,
+  MtpObjectNotFoundError,
 } from './mtp-errors.js';
-export { mtpDeviceFilters, MTP_INTERFACE_FILTER } from './mtp-device-filters.js';
+export { mtpDeviceFilters, MTP_INTERFACE_FILTER, type MtpDeviceFiltersOptions } from './mtp-device-filters.js';

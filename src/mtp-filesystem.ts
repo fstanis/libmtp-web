@@ -14,20 +14,20 @@ import {
 } from './mtp-session.js';
 
 export interface RequestMtpFileSystemOptions {
-  /** URL of dist/mtp.wasm. Defaults to the module-relative copy bundlers emit. */
+  /** URL of dist/mtp.wasm; relative strings resolve against the page URL. Defaults to the module-relative copy bundlers emit. */
   wasmUrl?: string | URL;
   /** Defaults to false; enables libmtp and WebUSB trace logging in the console. */
   isVerboseLogging?: boolean;
+  /** Overall deadline for loading the module, detecting, and opening the device; defaults to 30000. */
+  openTimeoutMs?: number;
 }
 
 /** Opens the first paired device; the returned file system holds it open until close(). */
 export async function requestMtpFileSystem(options: RequestMtpFileSystemOptions = {}): Promise<MtpFileSystem> {
-  // The new URL asset reference makes Webpack/Vite copy the wasm into the
-  // app's output; manual hosting passes the URL instead.
-  const wasmUrl = options.wasmUrl ?? new URL('./mtp.wasm', import.meta.url);
   const session = await MtpSession.open({
     isVerboseLogging: options.isVerboseLogging ?? false,
-    wasmUrl: new URL(wasmUrl).href,
+    wasmUrl: options.wasmUrl,
+    openTimeoutMs: options.openTimeoutMs,
   });
   return new MtpFileSystem(session);
 }
@@ -48,6 +48,14 @@ export class MtpFileSystem {
   /** Releases the device; all handles become unusable. */
   async close(): Promise<void> {
     await this.session.close();
+  }
+
+  /**
+   * Hard-releases a wedged device (bounded, never rejects) and resets it, so a fresh
+   * requestMtpFileSystem() recovers without replugging. All handles become unusable.
+   */
+  async abort(): Promise<void> {
+    await this.session.abort();
   }
 }
 
@@ -294,6 +302,16 @@ export class MtpFileHandle extends MtpHandleBase implements FileSystemFileHandle
     this.fileId = fileId;
     this.lastModifiedMs = lastModifiedMs;
     this.sizeBytes = sizeBytes;
+  }
+
+  /** Bytes as of the listing that produced this handle; moves to the uploaded count after a writable close. */
+  get size(): number {
+    return this.sizeBytes;
+  }
+
+  /** Epoch milliseconds as of the listing that produced this handle. */
+  get lastModified(): number {
+    return this.lastModifiedMs;
   }
 
   /** Rejects with NotFoundError for handles created with { create: true } until the first writable stream closes. */
